@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: Deploying via GitHub Actions to AWS EC2
 
 on:
   push:
