@@ -1,7 +1,7 @@
 services:
   mongo:
     image: mongo:7
-    container_name: lifedrop -mongo
+    container_name: lifedrop-mongo
     restart: always
     ports:
       - "27017:27017"
