@@ -1,4 +1,4 @@
-name: Deploying via GitHub Actions to AWS EC2
+name: LifeDrop CI/CD Pipeline
 
 on:
   push:
@@ -6,27 +6,179 @@ on:
       - main
 
 jobs:
-  docker:
+
+  # ==========================================
+  # 1. SONARQUBE CODE QUALITY
+  # ==========================================
+  sonarqube:
+    name: SonarQube Scan
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          fetch-depth: 0
 
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+
+  # ==========================================
+  # 2. BUILD + TRIVY SCAN
+  # ==========================================
+  security-scan:
+    name: Build and Trivy Scan
+    runs-on: ubuntu-latest
+    needs: sonarqube
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Build backend
       - name: Build backend image
-        run: docker build -t ${{ secrets.DOCKER_USERNAME }}/lifedrop-backend:latest ./backend
+        run: |
+          docker build \
+            -t lifedrop-backend:${{ github.sha }} \
+            ./backend
 
+      # Build frontend
       - name: Build frontend image
-        run: docker build -t ${{ secrets.DOCKER_USERNAME }}/lifedrop-frontend:latest ./frontend
+        run: |
+          docker build \
+            -t lifedrop-frontend:${{ github.sha }} \
+            ./frontend
 
+      # Trivy backend scan
+      - name: Trivy backend image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: lifedrop-backend:${{ github.sha }}
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+      # Trivy frontend scan
+      - name: Trivy frontend image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: lifedrop-frontend:${{ github.sha }}
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+
+  # ==========================================
+  # 3. PUSH IMAGES TO AWS ECR
+  # ==========================================
+  push-to-ecr:
+    name: Push Images to ECR
+    runs-on: ubuntu-latest
+    needs: security-scan
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build backend with ECR tag
+      - name: Build backend image
+        run: |
+          docker build \
+            -t ${{ secrets.ECR_REGISTRY }}/lifedrop-backend:latest \
+            -t ${{ secrets.ECR_REGISTRY }}/lifedrop-backend:${{ github.sha }} \
+            ./backend
+
+      # Build frontend with ECR tag
+      - name: Build frontend image
+        run: |
+          docker build \
+            -t ${{ secrets.ECR_REGISTRY }}/lifedrop-frontend:latest \
+            -t ${{ secrets.ECR_REGISTRY }}/lifedrop-frontend:${{ github.sha }} \
+            ./frontend
+
+      # Push backend
       - name: Push backend image
-        run: docker push ${{ secrets.DOCKER_USERNAME }}/lifedrop-backend:latest
+        run: |
+          docker push \
+            ${{ secrets.ECR_REGISTRY }}/lifedrop-backend:latest
 
+          docker push \
+            ${{ secrets.ECR_REGISTRY }}/lifedrop-backend:${{ github.sha }}
+
+      # Push frontend
       - name: Push frontend image
-        run: docker push ${{ secrets.DOCKER_USERNAME }}/lifedrop-frontend:latest
+        run: |
+          docker push \
+            ${{ secrets.ECR_REGISTRY }}/lifedrop-frontend:latest
+
+          docker push \
+            ${{ secrets.ECR_REGISTRY }}/lifedrop-frontend:${{ github.sha }}
+
+
+  # ==========================================
+  # 4. DEPLOY TO EC2
+  # ==========================================
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: push-to-ecr
+
+    steps:
+
+      - name: Deploy application to EC2
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          script: |
+            set -e
+
+            echo "Starting LifeDrop deployment..."
+
+            cd /opt/lifedrop
+
+            echo "Logging into AWS ECR..."
+
+            aws ecr get-login-password \
+              --region ${{ secrets.AWS_REGION }} | \
+              docker login \
+              --username AWS \
+              --password-stdin \
+              ${{ secrets.ECR_REGISTRY }}
+
+            echo "Pulling latest images..."
+
+            docker-compose pull
+
+            echo "Starting containers..."
+
+            docker-compose up -d
+
+            echo "Cleaning old images..."
+
+            docker image prune -f
+
+            echo "Checking containers..."
+
+            docker-compose ps
+
+            echo "Deployment completed successfully!"
